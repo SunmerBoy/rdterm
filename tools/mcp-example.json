@@ -1,0 +1,28 @@
+{
+  "_说明": "rdterm 的 MCP 接入示例。stdio 模式通用性最好（Claude Desktop / Cline / WorkBuddy 都支持）；HTTP 模式适合浏览器里的客户端或跨机调用。",
+  "_stdio_用法": "把下面 mcpServers.rdterm 整段拷到客户端的 MCP 配置里即可（WorkBuddy 是 ~/.workbuddy/mcp.json）。",
+  "mcpServers": {
+    "rdterm": {
+      "command": "D:\\rdterm\\rdterm.exe",
+      "args": ["--mcp"],
+      "_args_备注": "加 --server 可同时把本机当被控端跑起来；排障加 --log（日志走 stderr）",
+      "env": {}
+    }
+  },
+  "_http_用法": "先手动起服务：rdterm --mcp-http 127.0.0.1:8787 --server，然后 POST http://127.0.0.1:8787/mcp 发 JSON-RPC；GET /health 探活。",
+  "_工具列表": [
+    "rdterm_identity  查看本机 ID 与剩余有效期",
+    "rdterm_connect   连到对端开远程终端，返回 session id。peer 可填 12 位 ID（走 rendezvous）或 IP / IP:端口（直连 21118，不走服务器）",
+    "rdterm_exec      在会话里执行命令并返回输出",
+    "rdterm_read      取走会话尚未读取的输出",
+    "rdterm_sessions  列出当前所有会话",
+    "rdterm_resize    调整远端终端尺寸",
+    "rdterm_close     关闭会话"
+  ],
+  "_典型流程": [
+    "1) rdterm_identity 拿本机 ID（或让对方报 ID）",
+    "2) rdterm_connect {\"peer\":\"<ID 或 IP>\",\"rows\":24,\"cols\":120} -> session",
+    "3) rdterm_exec {\"session\":<id>,\"command\":\"whoami\"} -> 输出",
+    "4) rdterm_close {\"session\":<id>}"
+  ]
+}

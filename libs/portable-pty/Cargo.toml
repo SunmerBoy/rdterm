@@ -1,0 +1,56 @@
+# VENDORED. Do not edit upstream logic here.
+#
+# Upstream: https://github.com/rustdesk-org/wezterm  branch `rustdesk/pty_based_0.8.1`
+# Commit:   80174f8009f41565f0fa8c66dab90d4f9211ae16
+# Source:   the `pty/` subdirectory of that tree (wezterm is a workspace; we only need `pty`).
+#
+# Why vendored: Cargo fetches the whole wezterm history over git to resolve this
+# one dependency. That repository is far too large to survive a flaky proxy, so
+# every `cargo build` died in `git fetch` and never reached compilation. `pty/` is
+# self-contained (112 KB), so it is checked in instead. The one internal path
+# dependency (`filedescriptor`) was switched to the crates.io release above.
+
+[package]
+name = "portable-pty"
+version = "0.8.1"
+authors = ["Wez Furlong"]
+edition = "2018"
+repository = "https://github.com/wez/wezterm"
+description = "Cross platform pty interface"
+license = "MIT"
+documentation = "https://docs.rs/portable-pty"
+
+[dependencies]
+anyhow = "1.0"
+downcast-rs = "1.0"
+filedescriptor = "0.8"
+log = "0.4"
+libc = "0.2"
+nix = {version="0.25", features=["term"]}
+shell-words = "1.1"
+serde_derive = {version="1.0", optional=true}
+serde = {version="1.0", optional=true}
+serial = "0.4"
+
+[features]
+default = []
+serde_support = ["serde", "serde_derive"]
+
+[target."cfg(windows)".dependencies]
+bitflags = "1.3"
+lazy_static = "1.4"
+shared_library = "0.1"
+winapi = { version = "0.3", features = [
+    "winuser",
+    "consoleapi",
+    "handleapi",
+    "fileapi",
+    "namedpipeapi",
+    "synchapi",
+    "userenv"
+]}
+winreg = "0.10"
+
+[dev-dependencies]
+smol = "1.2"
+futures = "0.3"
