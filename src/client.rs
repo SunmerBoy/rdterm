@@ -2626,6 +2626,13 @@ pub struct LoginConfigHandler {
     id: String,
     pub conn_type: ConnType,
     pub is_terminal_admin: bool,
+    /// 本会话持有的远端 terminal service id（仅内存，不落盘）。
+    ///
+    /// 上游把它按对端 ID 存进 Peers/<id>.toml，本意是断线重连时续接同一个
+    /// 终端；但同一个对端开多个并行会话时，第二个会话登录会带上第一个会话
+    /// 的 service id，服务端将其误判为重连，触发 remap 并杀掉已有终端的
+    /// PTY。改为按会话内存持有：重连续接语义保留，多会话互不干扰。
+    pub(crate) terminal_service_id: String,
     hash: Hash,
     password: Vec<u8>, // remember password for reconnect
     pub remember: bool,
@@ -3671,7 +3678,7 @@ impl LoginConfigHandler {
             }),
             ConnType::TERMINAL => {
                 let mut terminal = Terminal::new();
-                terminal.service_id = self.get_option(self.get_key_terminal_service_id());
+                terminal.service_id = self.terminal_service_id.clone();
                 lr.set_terminal(terminal);
             }
             _ => {}

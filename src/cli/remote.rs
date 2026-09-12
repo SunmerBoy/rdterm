@@ -17,7 +17,7 @@ use hbb_common::rendezvous_proto::ConnType;
 
 use crate::ui_session_interface::{io_loop, Session};
 
-use super::console::{ConsoleHandler, CONNECT_TIMEOUT, OPEN_TIMEOUT, TERMINAL_ID};
+use super::console::{ConsoleHandler, CONNECT_TIMEOUT, OPEN_TIMEOUT};
 
 /// 会话注册表。id 从 1 开始自增。
 fn registry() -> &'static Mutex<HashMap<u32, Arc<RemoteSession>>> {
@@ -36,6 +36,13 @@ fn next_id() -> u32 {
 pub struct RemoteSession {
     pub id: u32,
     pub peer: String,
+    /// 远端 PTY 编号。每个会话必须不同：服务端对已存在的 terminal_id
+    /// 会走「重连既有终端」分支，两个会话就会共用同一个 shell。
+    pub terminal_id: i32,
+    /// 对端 shell 是不是 PowerShell（决定 exec 拼接哨兵时用 `;` 还是 `&`）。
+    is_powershell: std::sync::atomic::AtomicBool,
+    /// 上一次 exec 超时时检测到 PowerShell 续行符（>>），下一条命令前要先 Ctrl-C 重同步。
+    needs_resync: std::sync::atomic::AtomicBool,
     session: Session<ConsoleHandler>,
     handler: ConsoleHandler,
 }
@@ -71,7 +78,10 @@ impl RemoteSession {
             });
         }
 
-        session.open_terminal(TERMINAL_ID, rows, cols);
+        // 每个会话一个独立 terminal_id（1、2、3…）。服务端对已存在的 id 会
+        // 重连同一个 PTY，写死常量会让两个会话共享一个 shell。
+        let terminal_id = next_id() as i32;
+        session.open_terminal(terminal_id, rows, cols);
         if !handler.wait_opened(OPEN_TIMEOUT) {
             return Err(match handler.take_failure() {
                 Some(reason) => format!("打开终端失败: {reason}"),
@@ -80,8 +90,11 @@ impl RemoteSession {
         }
 
         let s = Arc::new(Self {
-            id: next_id(),
+            id: terminal_id as u32,
             peer: peer.to_owned(),
+            terminal_id,
+            is_powershell: std::sync::atomic::AtomicBool::new(true),
+            needs_resync: std::sync::atomic::AtomicBool::new(false),
             session,
             handler,
         });
@@ -96,17 +109,32 @@ impl RemoteSession {
     /// 当前输入行，长命令下这些重绘片段会混进输出里，导致结果无法解析
     /// （实测表现为命令回显被切成好几段、中间夹着 `> `）。关掉之后回显退化成
     /// 朴素模式，一行命令一行回显。非 PowerShell 环境这条命令不存在，无害。
+    ///
+    /// 顺便探测对端 shell 类型：PowerShell 会执行 `echo PROBE_$((6*7))` 得到
+    /// PROBE_42，cmd 只会原样回显，以此区分哨兵拼接用的分隔符（`;` vs `&`）。
     fn init_shell(&self) {
         self.send("Remove-Module PSReadLine -Force -ErrorAction SilentlyContinue");
         self.send(ENTER);
         // 等 PSReadLine 卸载完成，别让它的输出混进第一条命令。
         std::thread::sleep(Duration::from_millis(400));
-        let _ = self.take_output();
+        let mut intro = self.take_output();
+        self.send("echo PROBE_$((6*7))");
+        self.send(ENTER);
+        std::thread::sleep(Duration::from_millis(800));
+        intro.push_str(&self.take_output());
+
+        // "PS C:\..." 提示符或算术探测任一命中即认定 PowerShell。
+        let ps_prompt = intro.lines().any(|l| {
+            let t = l.trim_start();
+            t.starts_with("PS ") && t.contains(':') && t.contains('>')
+        });
+        self.is_powershell
+            .store(ps_prompt || intro.contains("PROBE_42"), std::sync::atomic::Ordering::SeqCst);
     }
 
     /// 往远端 PTY 写数据（不自动补换行，调用方自己决定）。
     pub fn send(&self, data: &str) {
-        self.session.send_terminal_input(TERMINAL_ID, data.to_owned());
+        self.session.send_terminal_input(self.terminal_id, data.to_owned());
     }
 
     /// 取走自上次读取以来累积的输出。
@@ -130,23 +158,32 @@ impl RemoteSession {
 
     /// 调整远端 PTY 尺寸，让 `ls` 之类的输出不至于被折成奇怪的宽度。
     pub fn resize(&self, rows: u32, cols: u32) {
-        self.session.resize_terminal(TERMINAL_ID, rows, cols);
+        self.session.resize_terminal(self.terminal_id, rows, cols);
     }
 
     /// 关闭远端终端并从注册表摘掉。
     pub fn close(&self) {
-        self.session.close_terminal(TERMINAL_ID);
+        self.session.close_terminal(self.terminal_id);
         self.session.close();
         self.handler.mark_closed();
         registry().lock().unwrap().remove(&self.id);
     }
 
-    /// 执行一条命令：丢掉历史输出 → 下发 → 等哨兵回显 → 返回本次输出。
+    /// 执行一条命令：丢掉历史输出 → 下发 → 等哨兵输出 → 返回本次输出。
     ///
-    /// 光靠「输出静默 N 毫秒」判定结束是不行的：PowerShell 启动慢，常常是
-    /// 第一条命令的输出在下一条命令打完之后才回来，调用方就会把 A 的输出当成 B 的。
-    /// 所以这里在命令后面追加一条 `echo <哨兵>`，等到远端把哨兵吐回来才认定这条跑完了；
-    /// 万一超时或命令进了交互模式（比如直接敲 `python`），就把已有输出返回并标记未完成。
+    /// 2026-09-12 重构（实测 16/20 测试矩阵暴露的竞态）：旧实现把哨兵作为
+    /// 第二条命令单独下发，而「输入回显完成」≠「命令执行完成」——ConPTY 对
+    /// 输入的回显是即时的，`hostname` 这种瞬时命令的**输出**还没到，静默判定
+    /// 就已通过、哨兵就已下发并被检测到，真实输出反而落在哨兵后面被裁掉。
+    ///
+    /// 新做法：把哨兵拼进**同一条输入行**（`cmd; echo MARK` / cmd 下用 `&`），
+    /// shell 一定在命令跑完后才会输出 MARK。于是 MARK 出现两次：
+    /// 第 1 次在输入回显行里（已知），第 2 次是 shell 的执行输出；
+    /// 两次出现之间的内容就是这条命令的完整输出，天然免竞态。
+    ///
+    /// 超时兜底：若输出里出现 PowerShell 续行符 `>>`（引号没闭合进了多行模式），
+    /// 标记会话需要重同步，下次 exec 前先发 Ctrl-C；若只是命令还在跑，则返回
+    /// 已有输出并标注未完成。
     pub fn exec(&self, command: &str, max_wait_ms: u64, quiet_ms: u64) -> ExecResult {
         // 先把上一条残留清掉，再给远端 shell 一点时间回到提示符。
         // 刚连上时 PowerShell 还在打印横幅，此时灌命令会被拆散。
@@ -154,44 +191,85 @@ impl RemoteSession {
         std::thread::sleep(Duration::from_millis(SETTLE_MS));
         self.take_output();
 
+        // 上一条超时时若卡在续行模式，这里先 Ctrl-C 拉回提示符。
+        if self
+            .needs_resync
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.send("\x03");
+            std::thread::sleep(Duration::from_millis(300));
+            self.take_output();
+            self.needs_resync
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+
         let deadline = Instant::now() + Duration::from_millis(max_wait_ms);
-        self.send(command);
-        if !command.ends_with('\n') {
-            self.send(ENTER);
-        }
-
-        // 等这条命令自己先跑安静了再发哨兵。
-        // 两条命令一起灌进去会被 ConPTY 拼成乱序输入（实测会出现 PowerShell 的续行符 `>>`）。
-        let mut acc = self.wait_quiet(quiet_ms, deadline);
-        if self.is_closed() {
-            return ExecResult {
-                output: tidy_lines(&strip_ansi(&acc)),
-                complete: false,
-            };
-        }
-
         let marker = new_marker();
-        self.send(&format!("echo {marker}{ENTER}"));
+
+        if command.contains('\n') {
+            // 多行输入（脚本粘贴）：老两步走——先灌命令，静默后再发哨兵行。
+            self.send(command);
+            if !command.ends_with('\n') {
+                self.send(ENTER);
+            }
+            let _ = self.wait_quiet(quiet_ms.max(200), deadline);
+            self.send(&format!("echo {marker}{ENTER}"));
+        } else {
+            // 单行命令（绝大多数场景）：哨兵拼进同一行，无输入时序竞态。
+            let sep = if self
+                .is_powershell
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                "; "
+            } else {
+                " & "
+            };
+            self.send(&format!("{command}{sep}echo {marker}{ENTER}"));
+        }
+
+        let mut acc = String::new();
+        let mut echo_cut: Option<(usize, usize)> = None; // (哨兵回显行起点, 该次匹配结束位置)
         loop {
             std::thread::sleep(Duration::from_millis(50));
             acc.push_str(&self.take_output());
             let clean = strip_ansi(&acc);
-            if let Some(pos) = clean.find(&marker) {
-                // 哨兵第一次出现是在「echo <哨兵>」这条命令的回显行里，
-                // 把它所在的那一行整行砍掉，剩下的就是上一条命令的回显 + 输出。
-                let cut = clean[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+
+            // 第一阶段：等哨兵在输入回显行里出现，记下裁剪起点。
+            if echo_cut.is_none() {
+                if let Some(pos) = clean.find(&marker) {
+                    let line_start = clean[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                    echo_cut = Some((line_start, pos + marker.len()));
+                }
+            }
+            // 第二阶段：等 shell 真正输出哨兵（第一次出现之后的第二次出现）。
+            if let Some((line_start, first_end)) = echo_cut {
+                if let Some(second) = clean[first_end..].find(&marker) {
+                    // 第二次哨兵出现所在行的行首，其之前的内容即本命令的回显+输出。
+                    let abs = first_end + second;
+                    let out_end = clean[..abs].rfind('\n').map(|i| i + 1).unwrap_or(abs);
+                    let output = &clean[line_start..out_end];
+                    return ExecResult {
+                        output: tidy_output(output),
+                        complete: true,
+                    };
+                }
+            }
+
+            if Instant::now() >= deadline || self.is_closed() {
+                // 超时：若卡在续行模式（输出里行尾有 `>>`），标记重同步。
+                if strip_ansi(&acc).lines().any(|l| l.trim_end().ends_with(">>")) {
+                    self.needs_resync
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                let output = match echo_cut {
+                    Some((line_start, _)) => tidy_output(&clean[line_start..]),
+                    None => tidy_lines(&strip_ansi(&acc)),
+                };
                 return ExecResult {
-                    output: tidy_lines(&clean[..cut]),
-                    complete: true,
+                    output,
+                    complete: false,
                 };
             }
-            if Instant::now() >= deadline || self.is_closed() {
-                break;
-            }
-        }
-        ExecResult {
-            output: tidy_lines(&strip_ansi(&acc)),
-            complete: false,
         }
     }
 
@@ -315,6 +393,54 @@ fn tidy_lines(s: &str) -> String {
         out.pop();
     }
     out.join("\n")
+}
+
+/// 判断一整行是不是 shell 提示符（`PS C:\Users\x>` / `C:\Windows>`）。
+fn is_prompt_line(line: &str) -> bool {
+    let t = line.trim();
+    let t = t.strip_prefix("PS ").unwrap_or(t);
+    // 盘符路径开头 + 以 `>` 收尾（后面没有命令内容）。
+    let bytes = t.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && bytes[2] == b'\\'
+        && t.ends_with('>')
+}
+
+/// exec 结果整理：在 `tidy_lines` 基础上剥掉提示符。
+///
+/// * 整行只有提示符的（首行、输出结束后的尾行）直接丢掉；
+/// * 首行是「提示符 + 命令回显」的，只去掉提示符前缀，保留回显。
+fn tidy_output(s: &str) -> String {
+    let mut lines: Vec<String> = tidy_lines(s)
+        .lines()
+        .map(|l| l.to_owned())
+        .collect();
+    if let Some(first) = lines.first_mut() {
+        // 首行剥提示符前缀："PS C:\Users\x> hostname" → "hostname"。
+        let t = first.as_str();
+        let t = t.strip_prefix("PS ").unwrap_or(t);
+        if let Some(gt) = t.find('>') {
+            let head = &t[..gt];
+            if head.len() >= 3
+                && head.as_bytes()[0].is_ascii_alphabetic()
+                && head.as_bytes()[1] == b':'
+                && head.as_bytes()[2] == b'\\'
+            {
+                *first = t[gt + 1..].trim_start().to_owned();
+            }
+        }
+    }
+    // 输出尾部若挂着孤立的提示符行（哨兵输出前的那次提示），去掉。
+    while lines.last().map(|l| is_prompt_line(l)).unwrap_or(false) {
+        lines.pop();
+    }
+    // 首行被剥空（命令回显为空）时也丢掉。
+    if lines.first().map(|l| l.is_empty()).unwrap_or(false) {
+        lines.remove(0);
+    }
+    lines.join("\n")
 }
 
 /// 取一个还活着的会话。

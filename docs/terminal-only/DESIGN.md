@@ -249,4 +249,52 @@ let exe_dir = std::env::current_exe()?.parent().unwrap().to_path_buf();
 - `libs/hbb_common` 已从 git submodule **内联（vendor）进主仓库**（含 confy 移除 + `Config::path()/log_path()` 的 `APP_DIR` 绿色化早退），`.gitmodules` 删除 —— 仓库自包含，clone 即可编译。
 - `libs/portable-pty` 为 vendored PTY 依赖。
 - 配套接管脚本收敛至 `tools/`，使用文档见根目录 `README.rdterm.md`。
+
+### 7.3 实测迭代（2026-09-12 下午，对端实测 805307194538）
+
+用 22 项测试矩阵（`tools/mcp-test-matrix.py`）对真实远端做了三轮「测试→定位→修复→回归」：
+
+| 轮次 | 结果 | 暴露问题 | 修复 |
+|---|---|---|---|
+| R1 | 16/20 | ① exec 输出错位/丢失：`hostname` 只返回回显；② 双会话共享同一 shell | ① 见 7.4；② 见 7.5 |
+| R2 | 17/20 | exec 时序修复后，双会话仍断流（S2 接入后 S1 永久无输出） | 见 7.5，本地 21118 直连复现后抓服务端日志定位 |
+| R3 | 22/22 ✅ | 全部通过；大输出 5000 行 0.5s | — |
+
+#### 7.4 exec 哨兵时序重构（src/cli/remote.rs）
+
+旧实现把哨兵作为第二条命令单独下发，靠「输出静默」判定命令结束。但 ConPTY 对**输入的回显是即时的**，
+`hostname` 这类瞬时命令的回显立刻满足静默条件，哨兵随即下发并被检测到——真实输出落在哨兵**之后**，
+被裁剪逻辑整段丢弃（表现为 exec 返回只有命令回显，输出出现在下一条命令的缓冲里）。
+
+新做法：**哨兵拼进同一条输入行**（PowerShell 用 `cmd; echo MARK`，cmd.exe 用 `& `，连接时以
+`echo PROBE_$((6*7))` 探测 shell 类型）。MARK 必然出现两次：第 1 次在输入回显行（已知位置），
+第 2 次是 shell 执行哨兵的输出——两次出现之间的内容就是完整输出，天然免竞态。
+超时兜底：检测到 PowerShell 续行符 `>>` 时标记会话，下次 exec 前自动 Ctrl-C 重同步。
+输出整理新增 `tidy_output`：剥离 `PS C:\...>` 提示符行。
+
+#### 7.5 多会话隔离修复（src/client.rs + client/io_loop.rs）
+
+现象：同一对端开第二个会话后，第一个会话永久断流（连输入回显都没有）。
+服务端日志定位到链路：
+
+```
+Connection #567 → "Remapping persistent session 1 -> 2 for reconnection"
+                  "Removed service: ts_f4c8…" → Terminal 1 的 PTY 被杀
+```
+
+根因：上游把 terminal service id 按对端 ID 持久化（`Peers/<peer>.toml` 的 `terminal-service-id`），
+本意是断线重连时续接同一终端。同一对端的第二个会话登录时把这个 id 带回去
+（`LoginRequest.terminal.service_id`），服务端 `get_or_create_service` 复用了第一个会话的 service，
+并把已存在的终端 remap 到新请求的 terminal_id——第一个终端的 PTY 被整个销毁。
+
+修复：service id 改为**按会话内存持有**（`LoginConfigHandler.terminal_service_id` 字段），
+不再落盘。同一会话断线重连仍可续接；并行会话各自持独立 id，登录时发空值让服务端新建 service。
+客户端每会话使用独立 terminal_id（1、2、3…），不再写死常量 1。
+
+#### 7.6 PowerShell 引号坑沉淀（非 bug，已写入工具描述）
+
+外层是 PowerShell 时：双引号字符串里的 `$var`/`$_` 会被**外层**展开；`powershell -c "...\"...\"..."`
+的嵌套双引号会在 PS→子进程传参时丢失（PS 5.1 经典行为）。测试矩阵 T12 因此三次翻车，最终以
+`powershell -NoProfile -EncodedCommand <UTF-16LE base64>` 为标准解（5000 行输出 0.5s）。
+该指引已写入 `rdterm_exec` 的工具描述，Agent 调用 tools/list 时即可见。
 5. **ID 稳定性**：绿色版每次换目录即换配置 → 换 ID。如需固定 ID，允许 `--config-dir` 指定或把配置写回同目录（默认已如此）。

@@ -102,7 +102,11 @@ fn tools() -> Vec<Value> {
             "name": "rdterm_exec",
             "description": "在指定会话里执行一条命令，返回该命令的输出（已剥掉 ANSI 转义与颜色码）。\
                              结束时机会等到命令真正跑完（内部追加 echo 哨兵判定），\
-                             所以不用担心拿到上一条命令的残留输出；超时会明确标注。",
+                             所以不用担心拿到上一条命令的残留输出；超时会明确标注。\
+                             注意：对端 shell 是 PowerShell——双引号里的 $ 变量会被外层展开，\
+                             嵌套双引号会在传参时丢失。含 $ 变量或嵌套引号的复杂命令，\
+                             推荐改用 -EncodedCommand（UTF-16LE 的 base64）；\
+                             多行脚本可直接在 command 里带换行。",
             "inputSchema": {
                 "type": "object",
                 "properties": {

@@ -89,7 +89,7 @@ rdterm.exe --mcp-http 127.0.0.1:8787              :: POST /mcp 走 JSON-RPC，GE
 |---|---|
 | `rdterm_identity` | 返回本机 ID / 轮换剩余 TTL 等身份信息 |
 | `rdterm_connect` | 连接对端（ID 或 IP），参数 `peer` / `rows` / `cols`，返回 `session` |
-| `rdterm_exec` | 在会话里执行一条命令并等待结果（哨兵判定 + ANSI 清洗） |
+| `rdterm_exec` | 在会话里执行一条命令并等待结果（哨兵判定 + ANSI 清洗）。注意：外层是 PowerShell，含 `$` 变量或嵌套引号的复杂命令推荐 `powershell -NoProfile -EncodedCommand <UTF-16LE base64>` |
 | `rdterm_read` | 读取会话当前缓冲输出（交互式场景） |
 | `rdterm_sessions` | 列出当前活动会话 |
 | `rdterm_resize` | 调整远端 PTY 行列 |
@@ -150,3 +150,4 @@ docs/terminal-only/      设计文档
 - S7 客户端 `io_loop` 视频线程的最终 gate、控制端窗口 resize 与远端 PTY 同步、噪音日志清理、`--stop` 在隐藏模式下的健壮性。
 - 目前仅支持 Windows x86_64；Linux/macOS 未适配。
 - 上游为 fork 快照，不保证能干净 rebase rustdesk 上游。
+- 2026-09-12 已通过 22 项实测矩阵（`tools/mcp-test-matrix.py`，对真实远端）：命令时序、长输出、多会话隔离、resize、中文、长命令轮询等全部通过；回归可直接 `python tools/mcp-test-matrix.py <ID或IP>`。

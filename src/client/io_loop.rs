@@ -2175,9 +2175,10 @@ impl<T: InvokeUiSession> Remote<T> {
                     use base::message_proto::terminal_response::Union;
                     if let Some(Union::Opened(opened)) = &response.union {
                         if opened.success && !opened.service_id.is_empty() {
-                            let mut lc = self.handler.lc.write().unwrap();
-                            let key = lc.get_key_terminal_service_id().to_owned();
-                            lc.set_option(key, opened.service_id.clone());
+                            // 只记在本会话内存里，不写 Peers/<peer>.toml ——
+                            // 落盘会让同一对端的下一个并行会话把本会话的
+                            // service id 带回去，被服务端当成重连而杀终端。
+                            self.handler.lc.write().unwrap().terminal_service_id = opened.service_id.clone();
                         }
                     }
                     self.handler.handle_terminal_response(response);
