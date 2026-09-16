@@ -137,12 +137,18 @@ docs/terminal-only/      设计文档
 | `mcp-selftest.py` | MCP stdio 全流程自检（initialize → tools/list → connect/exec） |
 | `takeover-demo.py` | 端到端接管演示 |
 | `mcp-example.json` | MCP 宿主接入配置示例 |
+| `security/security-tests.py` | 组网安全实测：直连明文抓包(T1)、零凭据访问(T2)、ID 通道加密(T3)、握手取证(T4) |
+| `security/id-analysis.py` | ID 随机性抽样(S1) 与注册凭证判定(S2) |
 
 ## 安全须知（务必阅读）
 
 - **本版本去掉了密码校验，ID 即唯一凭证**：拿到 ID 的任何人即可取得该机 shell。
   ID 每 12 小时轮换可缩小暴露窗口，但**请不要把 ID 泄露到不受信任的渠道**。
 - 默认开启 `0.0.0.0:21118` 直连监听；同网段设备可直接连。不需要时加 `--no-direct-server`。
+- **直连（IP:21118）路径是明文传输**，且不校验任何凭据；跨不可信网络请走 ID（rendezvous）路径或点对点 VPN。
+- `--mcp-http` 无鉴权，只在本机回环使用；跨机请用 stdio。
+- 完整的威胁模型、实测证据与加固清单见
+  [docs/security/rdterm-security-analysis.md](docs/security/rdterm-security-analysis.md)，部署红线见 [SECURITY.md](SECURITY.md)。
 - 仅供授权环境下的远程运维 / 取证 / 自动化使用，请遵守当地法律法规。
 
 ## 已知限制 / 待办
