@@ -9,6 +9,7 @@
 //! * 全局注册表按数字 id 管理会话，MCP 工具只认 id。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -25,6 +26,12 @@ fn registry() -> &'static Mutex<HashMap<u32, Arc<RemoteSession>>> {
     REG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// 对端 shell 方言。它决定 exec 把哨兵拼进同一行时用什么分隔符：
+/// PowerShell 只认 `;`，cmd 只认 `&`，给错了就是一条 ParserError。
+const DIALECT_UNKNOWN: u8 = 0;
+const DIALECT_PS: u8 = 1;
+const DIALECT_CMD: u8 = 2;
+
 fn next_id() -> u32 {
     static NEXT: OnceLock<Mutex<u32>> = OnceLock::new();
     let mut n = NEXT.get_or_init(|| Mutex::new(0)).lock().unwrap();
@@ -39,8 +46,8 @@ pub struct RemoteSession {
     /// 远端 PTY 编号。每个会话必须不同：服务端对已存在的 terminal_id
     /// 会走「重连既有终端」分支，两个会话就会共用同一个 shell。
     pub terminal_id: i32,
-    /// 对端 shell 是不是 PowerShell（决定 exec 拼接哨兵时用 `;` 还是 `&`）。
-    is_powershell: std::sync::atomic::AtomicBool,
+    /// 对端 shell 方言（决定 exec 拼接哨兵时用 `;` 还是 `&`，未知时另起一行下发）。
+    dialect: AtomicU8,
     /// 上一次 exec 超时时检测到 PowerShell 续行符（>>），下一条命令前要先 Ctrl-C 重同步。
     needs_resync: std::sync::atomic::AtomicBool,
     session: Session<ConsoleHandler>,
@@ -93,7 +100,7 @@ impl RemoteSession {
             id: terminal_id as u32,
             peer: peer.to_owned(),
             terminal_id,
-            is_powershell: std::sync::atomic::AtomicBool::new(true),
+            dialect: AtomicU8::new(DIALECT_UNKNOWN),
             needs_resync: std::sync::atomic::AtomicBool::new(false),
             session,
             handler,
@@ -110,8 +117,10 @@ impl RemoteSession {
     /// （实测表现为命令回显被切成好几段、中间夹着 `> `）。关掉之后回显退化成
     /// 朴素模式，一行命令一行回显。非 PowerShell 环境这条命令不存在，无害。
     ///
-    /// 顺便探测对端 shell 类型：PowerShell 会执行 `echo PROBE_$((6*7))` 得到
-    /// PROBE_42，cmd 只会原样回显，以此区分哨兵拼接用的分隔符（`;` vs `&`）。
+    /// 顺便探测对端 shell 方言：PowerShell 会执行 `echo PROBE_$((6*7))` 得到
+    /// PROBE_42，cmd 只会把 `$((6*7))` 当普通字符原样回显，据此区分哨兵拼接
+    /// 用的分隔符（`;` vs `&`）。两种证据都拿不到时判为 Unknown —— 这时 exec
+    /// 会退化成「哨兵另起一行」，不依赖任何分隔符，两种方言都不会报错。
     fn init_shell(&self) {
         self.send("Remove-Module PSReadLine -Force -ErrorAction SilentlyContinue");
         self.send(ENTER);
@@ -120,16 +129,45 @@ impl RemoteSession {
         let mut intro = self.take_output();
         self.send("echo PROBE_$((6*7))");
         self.send(ENTER);
-        std::thread::sleep(Duration::from_millis(800));
+
+        // 不靠固定 sleep 收结果：慢机器 / 高延迟链路上 800ms 未必回得来，
+        // 一漏判就会退回 cmd 的 `&`，在 PowerShell 5.1 上每条命令都报错。
+        // 轮询到拿到证据为止，最多等 PROBE_TIMEOUT_MS。
+        let probe_deadline = Instant::now() + Duration::from_millis(PROBE_TIMEOUT_MS);
+        let mut probe_hit = false;
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            intro.push_str(&self.take_output());
+            if intro.contains("PROBE_42") {
+                probe_hit = true;
+                break;
+            }
+            if Instant::now() >= probe_deadline {
+                break;
+            }
+        }
         intro.push_str(&self.take_output());
 
-        // "PS C:\..." 提示符或算术探测任一命中即认定 PowerShell。
+        // "PS C:\...>" 提示符或算术探测任一命中即认定 PowerShell。
         let ps_prompt = intro.lines().any(|l| {
             let t = l.trim_start();
             t.starts_with("PS ") && t.contains(':') && t.contains('>')
         });
-        self.is_powershell
-            .store(ps_prompt || intro.contains("PROBE_42"), std::sync::atomic::Ordering::SeqCst);
+        // 只看输入回显、没有求值结果，说明这是个不会算 `$()` 的 shell（cmd）。
+        let cmd_echo = !probe_hit && intro.contains("PROBE_$((6*7))");
+        let dialect = if probe_hit || ps_prompt {
+            DIALECT_PS
+        } else if cmd_echo {
+            DIALECT_CMD
+        } else {
+            DIALECT_UNKNOWN
+        };
+        self.dialect.store(dialect, Ordering::SeqCst);
+    }
+
+    /// 当前认定的 shell 方言。
+    fn dialect(&self) -> u8 {
+        self.dialect.load(Ordering::SeqCst)
     }
 
     /// 往远端 PTY 写数据（不自动补换行，调用方自己决定）。
@@ -176,15 +214,37 @@ impl RemoteSession {
     /// 输入的回显是即时的，`hostname` 这种瞬时命令的**输出**还没到，静默判定
     /// 就已通过、哨兵就已下发并被检测到，真实输出反而落在哨兵后面被裁掉。
     ///
-    /// 新做法：把哨兵拼进**同一条输入行**（`cmd; echo MARK` / cmd 下用 `&`），
-    /// shell 一定在命令跑完后才会输出 MARK。于是 MARK 出现两次：
-    /// 第 1 次在输入回显行里（已知），第 2 次是 shell 的执行输出；
-    /// 两次出现之间的内容就是这条命令的完整输出，天然免竞态。
+    /// 新做法：把哨兵拼进**同一条输入行**（PowerShell 用 `cmd; echo MARK`、
+    /// cmd 用 `cmd & echo MARK`），shell 一定在命令跑完后才会输出 MARK。
+    /// 于是 MARK 出现两次：第 1 次在输入回显行里（已知），第 2 次是 shell 的
+    /// 执行输出；两次出现之间的内容就是这条命令的完整输出，天然免竞态。
+    ///
+    /// 方言未知时（探测没拿到证据）不赌分隔符：命令和哨兵分两行下发，两种
+    /// shell 都会在前一条跑完后才执行 `echo MARK`，结果一样，但没有任何
+    /// 方言假设可错。
     ///
     /// 超时兜底：若输出里出现 PowerShell 续行符 `>>`（引号没闭合进了多行模式），
     /// 标记会话需要重同步，下次 exec 前先发 Ctrl-C；若只是命令还在跑，则返回
     /// 已有输出并标注未完成。
+    ///
+    /// 2026-09-24：探测万一判成 cmd 而对面其实是 PowerShell 5.1，`&` 会直接
+    /// 抛 ParserError。这里检测到该错误就把方言翻成 PowerShell 重试一次，
+    /// 不让整个会话一直错下去。
     pub fn exec(&self, command: &str, max_wait_ms: u64, quiet_ms: u64) -> ExecResult {
+        let mut r = self.exec_once(command, max_wait_ms, quiet_ms);
+        if !r.complete && self.dialect() != DIALECT_PS && looks_like_amp_error(&r.output) {
+            self.dialect.store(DIALECT_PS, Ordering::SeqCst);
+            // ParserError 不占用 stdin，但保险起见先把提示符拉干净再重发。
+            self.send("\x03");
+            std::thread::sleep(Duration::from_millis(300));
+            self.take_output();
+            r = self.exec_once(command, max_wait_ms, quiet_ms);
+        }
+        r
+    }
+
+    /// `exec` 的单次尝试：下发 → 等哨兵 → 返回本次输出。
+    fn exec_once(&self, command: &str, max_wait_ms: u64, quiet_ms: u64) -> ExecResult {
         // 先把上一条残留清掉，再给远端 shell 一点时间回到提示符。
         // 刚连上时 PowerShell 还在打印横幅，此时灌命令会被拆散。
         self.take_output();
@@ -216,15 +276,17 @@ impl RemoteSession {
             self.send(&format!("echo {marker}{ENTER}"));
         } else {
             // 单行命令（绝大多数场景）：哨兵拼进同一行，无输入时序竞态。
-            let sep = if self
-                .is_powershell
-                .load(std::sync::atomic::Ordering::SeqCst)
-            {
-                "; "
-            } else {
-                " & "
-            };
-            self.send(&format!("{command}{sep}echo {marker}{ENTER}"));
+            match self.dialect() {
+                DIALECT_PS => self.send(&format!("{command}; echo {marker}{ENTER}")),
+                DIALECT_CMD => self.send(&format!("{command} & echo {marker}{ENTER}")),
+                // 方言未知：分两行下发，cmd 与 PowerShell 都不会因为分隔符报错。
+                _ => {
+                    self.send(command);
+                    self.send(ENTER);
+                    std::thread::sleep(Duration::from_millis(SETTLE_MS));
+                    self.send(&format!("echo {marker}{ENTER}"));
+                }
+            }
         }
 
         let mut acc = String::new();
@@ -299,6 +361,21 @@ impl RemoteSession {
 
 /// 下发命令之前先空等一会儿，让远端 shell 回到提示符。
 const SETTLE_MS: u64 = 150;
+
+/// shell 方言探测最多等这么久（轮询，命中即提前返回）。
+const PROBE_TIMEOUT_MS: u64 = 3000;
+
+/// 输出里有没有 PowerShell 把 `&` 当分隔符时的解析错误。
+///
+/// 5.1 的原文是 `The token '&' is not a valid statement separator in this
+/// version.`，中文语言包是「标记“&”不是此版本中的有效语句分隔符。」。
+/// 只认这几个特征串，避免把命令自己的正常输出误判成解析错误。
+fn looks_like_amp_error(s: &str) -> bool {
+    s.contains("ParserError")
+        || s.contains("statement separator")
+        || s.contains("有效语句分隔符")
+        || s.contains("The token '&'")
+}
 
 /// 送进 PTY 的「回车」。
 ///
@@ -463,4 +540,25 @@ pub fn list() -> Vec<serde_json::Value> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn amp_parser_error_is_detected() {
+        let en = "At line:1 char:12\r\n+ hostname & echo RDTERM_DONE_1\r\n+            ~\r\nThe token '&' is not a valid statement separator in this version.\r\n    + CategoryInfo          : ParserError: (:) [], ParentContainsErrorRecordException";
+        let zh = "标记“&”不是此版本中的有效语句分隔符。";
+        assert!(looks_like_amp_error(en));
+        assert!(looks_like_amp_error(zh));
+        assert!(looks_like_amp_error("ParserError"));
+    }
+
+    #[test]
+    fn normal_output_is_not_an_amp_error() {
+        assert!(!looks_like_amp_error("DESKTOP-ABC123"));
+        assert!(!looks_like_amp_error("cmdlet 未找到 & 相关命令"));
+        assert!(!looks_like_amp_error(""));
+    }
 }
